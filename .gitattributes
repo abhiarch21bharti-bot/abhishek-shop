@@ -1,0 +1,10 @@
+# Saari text files repo mein bhi aur working folder mein bhi LF rakho
+* text=auto eol=lf
+
+# Ye files text nahi hain, inko chhedna mat
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff2 binary

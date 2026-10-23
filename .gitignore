@@ -1,0 +1,33 @@
+# Python ka machine-generated saaman
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Tools ke cache aur reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets aur local config
+.env
+.env.*
+!.env.example
+
+# Local database files
+*.sqlite3
+*.db
+
+# Editor aur OS ka kachra
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Flask instance folder
+instance/
