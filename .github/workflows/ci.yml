@@ -189,7 +189,153 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # 7. ONE job to mark as "required" in branch protection. If any job above
+  # ======================================================================
+  # RELEASE GATE: the three jobs below run ONLY on pull requests into main.
+  # On other events they are skipped, which all-checks-passed accepts.
+  # ======================================================================
+
+  # 7. Every release must bump the version, so tags and releases stay unique.
+  version-bump:
+    name: Version bump
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Version must differ from main, and its tag must not exist
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          BASE_VERSION=$(git show "$BASE_SHA:pyproject.toml" | python -c "import sys, tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])")
+          HEAD_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "main: $BASE_VERSION  ->  this PR: $HEAD_VERSION"
+          if [ "$BASE_VERSION" = "$HEAD_VERSION" ]; then
+            echo "::error::The version in pyproject.toml was not bumped. Run cz bump on a branch from dev first."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$HEAD_VERSION" >/dev/null; then
+            echo "::error::The tag v$HEAD_VERSION already exists."
+            exit 1
+          fi
+
+  # 8. Migrations and integration tests against a real SQL Server (the same
+  #    engine family as Azure SQL). SQLite is too forgiving to prove these.
+  database-tests:
+    name: Database and integration tests
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install the Microsoft ODBC driver
+        run: |
+          curl -sSfL -O "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb"
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+
+      # A random one-time password, created here and never stored anywhere.
+      - name: Start SQL Server
+        run: |
+          SA_PASSWORD="Aa1$(openssl rand -hex 12)"
+          echo "::add-mask::$SA_PASSWORD"
+          docker run -d --name sqlserver -p 1433:1433 \
+            -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$SA_PASSWORD" \
+            mcr.microsoft.com/mssql/server:2022-latest
+          for i in $(seq 1 30); do
+            if docker exec sqlserver /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$SA_PASSWORD" -Q "SELECT 1" >/dev/null 2>&1; then
+              echo "SQL Server is ready"
+              break
+            fi
+            echo "Waiting for SQL Server ($i/30)..."
+            sleep 3
+          done
+          docker exec sqlserver /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$SA_PASSWORD" -Q "CREATE DATABASE shop_test"
+          echo "DATABASE_URL=mssql+pyodbc://sa:${SA_PASSWORD}@localhost:1433/shop_test?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt pyodbc
+
+      - name: Migrations apply to an empty database
+        run: alembic upgrade head
+
+      - name: There is only one migration head
+        run: |
+          HEADS=$(alembic heads | grep -c '(head)')
+          echo "Heads found: $HEADS"
+          [ "$HEADS" -eq 1 ]
+
+      - name: Models match migrations (no drift)
+        run: alembic check
+
+      - name: Migration round trip (downgrade, then upgrade again)
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Integration tests
+        run: |
+          set +e
+          python -m pytest -m integration --no-cov -ra
+          CODE=$?
+          if [ "$CODE" -eq 5 ]; then
+            echo "::warning::No integration tests found yet. Add tests marked @pytest.mark.integration."
+            exit 0
+          fi
+          exit "$CODE"
+
+  # 9. The package builds, includes its templates, and installs in a clean environment.
+  build-package:
+    name: Build package
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: Templates are inside the wheel
+        run: |
+          unzip -l dist/*.whl | grep -q "abhishek/templates/" || {
+            echo "::error::Templates are missing from the wheel. Add [tool.setuptools.package-data] to pyproject.toml."
+            exit 1
+          }
+
+      - name: Wheel installs and imports in a clean environment
+        run: |
+          python -m venv /tmp/cleanenv
+          /tmp/cleanenv/bin/pip install -r requirements.txt dist/*.whl
+          /tmp/cleanenv/bin/python -c "import abhishek; print('import ok')"
+
+  # 10. ONE job to mark as "required" in branch protection. If any job above
   #    fails or is cancelled, this fails and the PR cannot merge.
   #    Jobs skipped on purpose (PR-only jobs on a push) are fine.
   all-checks-passed:
@@ -202,6 +348,9 @@ jobs:
       - tests
       - security
       - pr-title
+      - version-bump
+      - database-tests
+      - build-package
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job did not succeed

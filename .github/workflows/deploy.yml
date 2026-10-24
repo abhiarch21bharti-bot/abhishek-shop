@@ -1,0 +1,147 @@
+name: Release and deploy
+
+# Runs after a pull request is merged into main:
+#   build -> staging (automatic) -> production (waits for a human approval)
+#         -> tag and publish the GitHub release
+#
+# The approval comes from the "production" environment's required reviewers
+# (Settings > Environments > production).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One release pipeline at a time. Never cancel a deployment half way.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  build:
+    name: Build release package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Read the version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install build
+          python -m build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: dist/
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: dist
+
+      # PLACEHOLDER until Azure is set up. When it is, replace this step with the
+      # Azure login and deploy steps (see the template at the bottom of this job).
+      - name: Deploy
+        run: |
+          echo "Deploying version ${{ needs.build.outputs.version }} to staging"
+          echo "::warning::The deploy step is a placeholder. Nothing was deployed."
+
+      # Runs only when the staging environment has a SITE_URL variable.
+      - name: Smoke test (health endpoint)
+        if: vars.SITE_URL != ''
+        run: >
+          curl --fail --silent --show-error
+          --retry 10 --retry-delay 15 --retry-all-errors
+          "${{ vars.SITE_URL }}/health"
+
+      # Template for later (also add "permissions: id-token: write" to this job):
+      #
+      # - uses: azure/login@v2
+      #   with:
+      #     client-id: ${{ vars.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # - uses: azure/webapps-deploy@v3
+      #   with:
+      #     app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+      #     package: dist/   # the package format depends on how you host the app
+
+  deploy-production:
+    name: Deploy to production
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # This job pauses here until a required reviewer approves it.
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: dist
+
+      # PLACEHOLDER, same as staging.
+      - name: Deploy
+        run: |
+          echo "Deploying version ${{ needs.build.outputs.version }} to production"
+          echo "::warning::The deploy step is a placeholder. Nothing was deployed."
+
+      - name: Smoke test (health endpoint)
+        if: vars.SITE_URL != ''
+        run: >
+          curl --fail --silent --show-error
+          --retry 10 --retry-delay 15 --retry-all-errors
+          "${{ vars.SITE_URL }}/health"
+
+  release:
+    name: Tag and publish release
+    needs: [build, deploy-production]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # needed to create the tag and the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: dist
+
+      - name: Create the tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists. Nothing to do."
+          else
+            gh release create "v$VERSION" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "v$VERSION" \
+              --generate-notes
+          fi
