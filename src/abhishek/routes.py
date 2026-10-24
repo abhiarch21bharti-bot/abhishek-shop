@@ -10,6 +10,7 @@ main_bp = Blueprint("main", __name__)
 
 @main_bp.get("/health")
 def health_check() -> tuple[Response, int]:
+    """Return a simple status so monitoring tools can check the app is alive."""
     return jsonify({"status": "ok"}), 200
 
 
