@@ -1,48 +1,214 @@
-name: Python CI
+name: CI
 
+# One workflow for everything:
+#   - pull request to dev/main  -> full gate (this is what blocks merging)
+#   - push to dev/main          -> same checks again after the merge, as a safety net
+#   - manual run                -> from the Actions tab
 on:
-  push:
-    branches:
-      - dev
   pull_request:
-    branches:
-      - dev
-      - main
+    branches: [dev, main]
+    # "edited" re-runs the checks when the PR title changes (needed for the title check)
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
 
+# A new push to the same PR cancels the older, outdated run.
+# Runs on dev/main are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default, so a compromised step cannot write to the repo.
 permissions:
   contents: read
 
+env:
+  PYTHON_VERSION: "3.14"
+
 jobs:
-  quality-checks:
-    name: Quality Checks
+  # 1. Repeats the local pre-commit hooks in a clean environment, so skipping
+  #    them with --no-verify on a laptop does not help.
+  hygiene:
+    name: Hygiene and style
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
+    env:
+      # The gitleaks pre-commit hook only scans *staged* changes, which do not
+      # exist in CI. The "Secret scan" job below scans the commits instead.
+      SKIP: gitleaks
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      # Runs: file checks, check-toml/yaml, ruff-check, ruff-format, etc.
+      - name: Run pre-commit hooks on all files
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  # 2. Every commit in the PR must follow "feat: ..." / "fix: ..." style.
+  #    (PRs only)
+  commit-messages:
+    name: Commit messages
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install commitizen
+        run: pip install commitizen
+
+      - name: Check every commit message in this PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: cz check --rev-range "$BASE_SHA..$HEAD_SHA"
+
+  # 3. Scans every commit (not just the final files), because a secret that
+  #    was committed and then deleted is still in git history.
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GITLEAKS_VERSION: "8.27.2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan the new commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            LOG_OPTS="$PR_BASE_SHA..$PR_HEAD_SHA"
+          elif [ -n "$PUSH_BEFORE_SHA" ] && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            LOG_OPTS="$PUSH_BEFORE_SHA..$PUSH_SHA"
+          else
+            LOG_OPTS="--max-count=1"
+          fi
+          echo "Scanning: $LOG_OPTS"
+          gitleaks git --redact --verbose --log-opts="$LOG_OPTS"
+
+  # 4. Type checking, unit tests, and the coverage gate (fail_under in pyproject.toml).
+  tests:
+    name: Types and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
 
+      # requirements-dev.txt must include pytest-cov (used for the coverage gate).
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: Run Ruff lint
-        run: python -m ruff check .
-
-      - name: Check formatting
-        run: python -m ruff format --check .
-
-      - name: Run tests
-        run: python -m pytest
-
-      - name: Run mypy
+      - name: Type check (mypy)
         run: python -m mypy
+
+      - name: Unit tests with coverage
+        run: python -m pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # 5. Security scans: vulnerable dependencies and insecure code patterns.
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install scanners
+        run: pip install pip-audit bandit
+
+      # Change the file name if your dependency list is not requirements.txt.
+      - name: Dependency vulnerabilities (pip-audit)
+        run: pip-audit -r requirements.txt
+
+      - name: Insecure code patterns (bandit)
+        run: bandit -r src --severity-level medium
+
+  # 6. The PR title becomes the commit message on squash merge, so it must
+  #    follow the same "feat: ..." style. (PRs only)
+  pr-title:
+    name: PR title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 7. ONE job to mark as "required" in branch protection. If any job above
+  #    fails or is cancelled, this fails and the PR cannot merge.
+  #    Jobs skipped on purpose (PR-only jobs on a push) are fine.
+  all-checks-passed:
+    name: all-checks-passed
+    if: always()
+    needs:
+      - hygiene
+      - commit-messages
+      - secret-scan
+      - tests
+      - security
+      - pr-title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job did not succeed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] \
+             || [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "One or more required checks did not pass."
+            exit 1
+          fi
+          echo "All checks passed."
