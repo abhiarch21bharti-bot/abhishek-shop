@@ -5,7 +5,7 @@ from abhishek.models import Product
 
 
 @click.command("seed")
-def seed_command():
+def seed_command() -> None:
     """Add sample products to the database."""
     sample_products = [
         {
