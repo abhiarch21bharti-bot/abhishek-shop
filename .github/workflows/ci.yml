@@ -271,6 +271,14 @@ jobs:
           docker exec sqlserver /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$SA_PASSWORD" -Q "CREATE DATABASE shop_test"
           echo "DATABASE_URL=mssql+pyodbc://sa:${SA_PASSWORD}@localhost:1433/shop_test?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes" >> "$GITHUB_ENV"
 
+      # migrations/env.py calls create_app(), and the app refuses to start without
+      # a SECRET_KEY. This is a random one-time value that only exists in this job.
+      - name: Set throwaway app secrets
+        run: |
+          SECRET_KEY="$(openssl rand -hex 32)"
+          echo "::add-mask::$SECRET_KEY"
+          echo "SECRET_KEY=$SECRET_KEY" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
