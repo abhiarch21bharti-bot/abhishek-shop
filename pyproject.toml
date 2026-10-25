@@ -4,26 +4,86 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abhishek-shop"
-version = "0.1.0"
+version = "0.2.0"
 description = "A modular shopping application built with Flask"
 requires-python = ">=3.14,<3.15"
 
+# Tools used while developing (not needed to run the app).
+# Install with:  pip install -e ".[dev]"
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "mypy",
+    "ruff",
+    "pre-commit",
+    "commitizen",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+[tool.setuptools.package-data]
+abhishek = ["templates/**/*", "static/**/*"]
 
+# ---------------------------------------------------------------- Ruff
 [tool.ruff]
 line-length = 88
 target-version = "py314"
 src = ["src"]
+# Alembic generates these files; we do not lint auto-generated code.
+extend-exclude = ["migrations/versions"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = [
+    "E", "W",   # pycodestyle errors and warnings
+    "F",        # pyflakes (unused imports, undefined names)
+    "I",        # isort (import sorting)
+    "B",        # flake8-bugbear (likely bugs)
+    "UP",       # pyupgrade (modern syntax)
+    "S",        # flake8-bandit (security)
+    "N",        # pep8-naming
+    "C4",       # flake8-comprehensions
+    "SIM",      # flake8-simplify
+    "RET",      # flake8-return
+    "DTZ",      # flake8-datetimez (timezone-aware datetimes)
+    "T20",      # flake8-print (no stray print())
+    "PT",       # flake8-pytest-style
+    "RUF",      # ruff-specific rules
+]
 
+[tool.ruff.lint.per-file-ignores]
+# pytest relies on assert, and tests use fake passwords.
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["abhishek"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+# -------------------------------------------------------------- Pytest
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: tests that use a real database or several components together",
+]
 
+# ------------------------------------------------------------ Coverage
+# Used by pytest-cov. Run in CI with:  pytest --cov
+[tool.coverage.run]
+source_pkgs = ["abhishek"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 70
+
+# ---------------------------------------------------------------- Mypy
 [tool.mypy]
 python_version = "3.14"
 mypy_path = "src"
@@ -31,4 +91,25 @@ files = ["src"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+show_error_codes = true
 disable_error_code = ["name-defined"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "migrations.*"
+ignore_errors = true
+
+# --------------------------------------------------------- Commitizen
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "pep621"          # reads/bumps [project] version
+tag_format = "v$version"
+update_changelog_on_bump = true
+major_version_zero = true
